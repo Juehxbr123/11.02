@@ -466,6 +466,12 @@
       animation: endBadgePop 3s ease-out forwards;
       z-index: 4;
     }
+        .endBadge.persistent{
+      animation:none;
+      opacity:1;
+      transform:translateX(-50%) scale(1);
+    }
+
     @keyframes endBadgePop{
       0%   { transform: translate(-50%,0) scale(0); opacity:0; }
       12%  { transform: translate(-50%,0) scale(1); opacity:1; }
@@ -1230,6 +1236,11 @@
   let lobbyState = null;
   let gameState = null;
   let ready = false;
+  let actionLocks = { take:false, pass:false, end:false, ready:false, resign:false, card:false, transfer:false };
+
+  function resetActionLocks(){
+    actionLocks = { take:false, pass:false, end:false, ready:false, resign:false, card:false, transfer:false };
+  }
   let lobbyReadyDeadlineTs = null;
 
   function resetToMenu(message, disableReconnect = false){
@@ -1336,6 +1347,7 @@
         lobbyReadyDeadlineTs = msg.readyDeadlineTs || null;
         localStorage.setItem("evil_in_game", "0");
         hideMenuForGame(true);
+        resetActionLocks();
         renderLobby();
         showLobbyUI(true);
         return;
@@ -1348,6 +1360,7 @@
         lobbyReadyDeadlineTs = null;
         localStorage.setItem("evil_in_game", "1");
         hideMenuForGame(true);
+        resetActionLocks();
         renderGame();
         showLobbyUI(false);
         return;
@@ -1668,8 +1681,10 @@
   };
 
   btnResign.onclick = () => {
-    if (!gameState) return;
+    if (!gameState || actionLocks.resign) return;
     if (!confirm("Вы уверены что хотите сдаться?")) return;
+    actionLocks.resign = true;
+    btnResign.disabled = true;
     sendMsg({ type:"action", action:{ kind:"resign" } });
   };
 
@@ -1687,22 +1702,30 @@
   const btnEnd   = document.getElementById("btnEnd");
 
   btnReady.onclick = () => {
+    if (actionLocks.ready) return;
+    actionLocks.ready = true;
     ready = !ready;
     btnReady.textContent = ready ? "Готов ✓" : "Готов";
     sendMsg({ type:"ready", ready });
   };
 
   btnTake.onclick = () => {
+    if (actionLocks.take) return;
+    actionLocks.take = true;
     btnTake.disabled = true;
     sendMsg({ type:"action", action:{ kind:"take" } });
-    setTimeout(()=>btnTake.disabled=false, 800);
   };
   btnPass.onclick = () => {
+    if (actionLocks.pass) return;
+    actionLocks.pass = true;
     btnPass.disabled = true;
-    sendMsg({ type:"action", action:{ kind:"pass" } });
-    setTimeout(()=>btnPass.disabled=false, 800);
+    const kind = (gameState?.takingReason === "bito") ? "end" : "pass";
+    sendMsg({ type:"action", action:{ kind } });
   };
   btnEnd.onclick = () => {
+    if (actionLocks.end) return;
+    actionLocks.end = true;
+    btnEnd.disabled = true;
     sendMsg({ type:"action", action:{ kind:"end" } });
   };
 
@@ -1921,6 +1944,21 @@
     setTimeout(cleanup, 3200);
   }
 
+
+  function applyPersistentCrowns(st){
+    document.querySelectorAll(".endBadge.persistent").forEach(n => n.remove());
+    if (!st || !st.exitedRoles) return;
+    for (const role of Object.keys(st.exitedRoles)) {
+      if (!st.exitedRoles[role]) continue;
+      const ava = document.querySelector(`.avatarWrap[data-role="${cssEscape(role)}"]`);
+      if (!ava) continue;
+      const b = document.createElement("div");
+      b.className = "endBadge persistent";
+      b.textContent = "👑";
+      ava.appendChild(b);
+    }
+  }
+
   let lastFinishKey = null;
   function applyEndBadges(st){
     if (!st || st.phase !== "finished") return;
@@ -2124,13 +2162,18 @@
       modeBadges.style.display = "none";
     }
 
-	btnPass.textContent = (gameState.phase === "taking" && gameState.throwInMode === "all") ? "БИТО" : "ПАС";
+    const meExited = !!gameState.exitedRoles?.[me];
+    btnPass.textContent = (gameState.phase === "taking" && gameState.takingReason === "bito") ? "БИТО" : "ПАС";
     btnReady.style.display = "none";
-    btnTake.style.display = (gameState.phase !== "finished" && me === gameState.defender && anyOnTable && gameState.phase === "defend") ? "inline-block" : "none";
-    btnPass.style.display = (gameState.phase !== "finished" && gameState.phase === "taking" && me !== gameState.defender) ? "inline-block" : "none";
-    btnEnd.style.display  = (gameState.phase !== "finished" && me === gameState.attacker && gameState.phase === "attack" && allDef) ? "inline-block" : "none";
+    btnTake.style.display = (!meExited && gameState.phase !== "finished" && me === gameState.defender && anyOnTable && gameState.phase === "defend") ? "inline-block" : "none";
+    btnPass.style.display = (!meExited && gameState.phase !== "finished" && gameState.phase === "taking" && me !== gameState.defender && !(gameState.takingPass?.[me])) ? "inline-block" : "none";
+    btnEnd.style.display  = (!meExited && gameState.phase !== "finished" && me === gameState.attacker && gameState.phase === "attack" && allDef) ? "inline-block" : "none";
     btnExitLobby.style.display = "none";
-    btnResign.style.display = (gameState.phase !== "finished") ? "inline-block" : "none";
+    btnResign.style.display = (!meExited && gameState.phase !== "finished") ? "inline-block" : "none";
+    btnTake.disabled = !!actionLocks.take;
+    btnPass.disabled = !!actionLocks.pass;
+    btnEnd.disabled = !!actionLocks.end;
+    btnResign.disabled = !!actionLocks.resign;
 
     if (typeof prevDiscardCount === "number" && typeof gameState.discardCount === "number") {
       pendingDiscardAnimation = gameState.discardCount > prevDiscardCount;
@@ -2140,6 +2183,7 @@
     renderHand(gameState);
     renderFinish(gameState);
     if (gameState.phase !== "finished") lastFinishKey = null;
+    applyPersistentCrowns(gameState);
 	applyEndBadges(gameState);
 
 
@@ -2188,6 +2232,7 @@
     const st = gameState;
     if (!st) return false;
     if (st.phase === "finished") return false;
+    if (st.exitedRoles?.[st.youRole]) return false;
     return true; // server validates anyway; client only hints
   }
 
@@ -2249,7 +2294,8 @@
 
   function doDrop(slotIndex, card){
     const st = gameState;
-    if (!st) return;
+    if (!st || actionLocks.card) return;
+    actionLocks.card = true;
     const me = st.youRole;
     const slot = st.table?.[slotIndex] || null;
 
@@ -2262,6 +2308,8 @@
   }
 
   function doTransfer(card){
+    if (actionLocks.transfer) return;
+    actionLocks.transfer = true;
     sendMsg({ type:"action", action:{ kind:"transfer", cardId: card.id } });
   }
 
