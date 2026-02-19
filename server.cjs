@@ -57,6 +57,31 @@ function broadcastToRoom(room, data) {
 }
 
 
+function ensureUserSingleRoom(ws, userKey) {
+  const existingRoomId = userToRoom.get(userKey);
+  if (!existingRoomId) return null;
+  const existingRoom = rooms.get(existingRoomId);
+  if (!existingRoom) {
+    userToRoom.delete(userKey);
+    return null;
+  }
+  if (ws.roomId === existingRoomId) return null;
+  send(ws, { type:"error", message:"Вы уже в другом лобби" });
+  return existingRoom;
+}
+
+function pruneRoomMembership(room) {
+  if (!room) return;
+  room.players = room.players.filter(p => p && p.userKey);
+  for (const p of room.players) {
+    if (userToRoom.get(p.userKey) !== room.id) {
+      if (!p.ws) continue;
+      userToRoom.set(p.userKey, room.id);
+    }
+  }
+  deleteRoomIfEmpty(room, { broadcast: false });
+}
+
 /** ======================
  *  Data
  ======================= */
@@ -116,6 +141,7 @@ function buildLobbyLists() {
   const priv = [];
   const emptyRooms = [];
   for (const room of rooms.values()) {
+    pruneRoomMembership(room);
     const playersCount = room.players.filter(p => !!p.userKey).length;
 
     // 0 игроков — в идеале таких уже не будет (удалим ниже), но на всякий
@@ -246,7 +272,13 @@ function buildRoles(maxPlayers) {
 }
 
 function throwInRoles(room, state) {
-  const roles = room.roles.filter(r => r !== state.defender);
+  const roles = room.roles.filter(r => {
+    if (r === state.defender) return false;
+    if (state.exitedRoles?.[r]) return false;
+    const pl = getPlayer(room, r);
+    if (!pl || !pl.userKey) return false;
+    return !!pl.ws;
+  });
   if (room.throwInMode !== "neighbors" || room.roles.length < 4) return roles;
 
   const idx = room.roles.indexOf(state.defender);
@@ -255,15 +287,26 @@ function throwInRoles(room, state) {
   return roles.filter(r => r === prev || r === next);
 }
 
-function dealUpTo6(state, role) {
+function dealUpTo6(state, role, room) {
+  if (room.winMode === "draw" && state.exitedRoles?.[role]) return;
   const hand = state.players[role].hand;
   while (hand.length < 6 && state.deck.length > 0) hand.push(state.deck.shift());
+}
+
+function markExitedDrawAtTurnEnd(room, state) {
+  if (room.winMode !== "draw") return;
+  for (const r of room.roles) {
+    if (state.exitedRoles?.[r]) continue;
+    if ((state.players?.[r]?.hand?.length || 0) === 0) {
+      state.exitedRoles[r] = true;
+    }
+  }
 }
 
 function dealRound(state, room) {
   let r = state.attacker;
   for (let i = 0; i < room.roles.length; i++) {
-    dealUpTo6(state, r);
+    dealUpTo6(state, r, room);
     r = nextRole(room, r);
   }
 }
@@ -301,7 +344,7 @@ function isOutClassic(room, state, role) {
 
 function isOutDraw(room, state, role) {
   if (room.winMode !== "draw") return false;
-  return (state.players?.[role]?.hand?.length || 0) === 0;
+  return !!state.exitedRoles?.[role];
 }
 
 function isOutRole(room, state, role) {
@@ -369,6 +412,7 @@ function finalizeTakingRound(room, state, defender) {
     if (checkImmediateClassicWin(room, state)) return state;
 
     dealRound(state, room);
+    markExitedDrawAtTurnEnd(room, state);
 
     state.attacker = nextActiveRole(room, state, defender);
     state.defender = nextActiveRole(room, state, state.attacker);
@@ -383,6 +427,7 @@ function finalizeTakingRound(room, state, defender) {
     if (checkImmediateClassicWin(room, state)) return state;
 
     dealRound(state, room);
+    markExitedDrawAtTurnEnd(room, state);
 
     state.attacker = defender;
     if (isOutRole(room, state, state.attacker)) state.attacker = nextActiveRole(room, state, state.attacker);
@@ -462,12 +507,7 @@ function finishDraw(state, room) {
 }
 
 function checkImmediateClassicWin(room, state) {
-  if (state.phase === "finished") return true;
-  if (room.winMode !== "classic") return false;
-  const winner = room.roles.find(r => (state.players?.[r]?.hand?.length || 0) === 0);
-  if (!winner) return false;
-  finishClassicImmediate(state, room, winner);
-  return true;
+  return state.phase === "finished";
 }
 
 function checkFinish(room, state) {
@@ -486,7 +526,16 @@ function checkFinish(room, state) {
   }
 
   if (room.winMode === "classic") {
-    if (checkImmediateClassicWin(room, state)) return true;
+    if (state.deck.length > 0) return false;
+    const withCards = room.roles.filter(r => (state.players[r]?.hand?.length || 0) > 0);
+    if (withCards.length === 0) {
+      finishClassic(state, room, null);
+      return true;
+    }
+    if (withCards.length === 1) {
+      finishClassic(state, room, withCards[0]);
+      return true;
+    }
     return false;
   }
 
@@ -536,10 +585,11 @@ function createNewGame(room) {
     takingPass: {},
     takingLeaderPassed: false,
     takingReason: null,
+    exitedRoles: {},
   };
 
   for (const r of room.roles) state.players[r] = { hand: [] };
-  for (const r of room.roles) dealUpTo6(state, r);
+  for (const r of room.roles) dealUpTo6(state, r, room);
 
   const firstAttacker = lowestTrumpAttacker(room, state);
   if (firstAttacker) {
@@ -597,6 +647,7 @@ function applyAction(room, state, role, action) {
   if (!action?.kind) return null;
   if (state.phase === "finished") return null;
   if (!room.roles.includes(role)) return null;
+  if (state.exitedRoles?.[role]) return null;
 
   const attacker = state.attacker;
   const defender = state.defender;
@@ -749,6 +800,7 @@ function applyAction(room, state, role, action) {
     pair.defend = hand.splice(idx, 1)[0];
 
 	if (state.table.filter(Boolean).every(p => p.defend)) {
+      if (checkFinish(room, state)) return state;
       state.phase = "taking";
       state.message = "Отбито. Подкиньте или нажмите ПАС.";
       state.takingReason = "bito";
@@ -781,6 +833,7 @@ if (state.phase !== "taking") return null;
     if (!roleCanActInTaking(state, role, attacker, defender)) return null;
 
     if (Object.prototype.hasOwnProperty.call(state.takingPass, role)) {
+      if (state.takingPass[role] === true) return null;
       state.takingPass[role] = true;
     }
     if (role === attacker) {
@@ -798,6 +851,7 @@ return finalizeTakingRound(room, state, defender);
       if (!roleCanActInTaking(state, role, attacker, defender)) return null;
 
       if (Object.prototype.hasOwnProperty.call(state.takingPass, role)) {
+        if (state.takingPass[role] === true) return null;
         state.takingPass[role] = true;
       }
       if (role === attacker) state.takingLeaderPassed = true;
@@ -835,6 +889,9 @@ function scheduleTurnTimer(room) {
 
   const state = room.state;
   if (state.phase === "finished") return;
+
+  const justFinished = checkFinish(room, state);
+  if (justFinished || state.phase === "finished") return;
 
   normalizeTurn(room, state);
 
@@ -915,6 +972,7 @@ function sanitizeStateFor(room, role, state) {
     takingPass: state.takingPass || {},
     takingLeaderPassed: !!state.takingLeaderPassed,
     takingReason: state.takingReason || null,
+    exitedRoles: state.exitedRoles || {},
 
     activeRole: state.activeRole,
     deadlineTs: state.deadlineTs,
@@ -960,7 +1018,7 @@ function sendLobbyState(room) {
         isPrivate: !!room.isPrivate,
         maxPlayers: room.maxPlayers,
         roles: room.roles,
-        winMode: room.winMode,+
+        winMode: room.winMode,
         allowTransfer: !!room.allowTransfer,
         throwInMode: room.throwInMode || "all",
         readyDeadlineTs: room.readyDeadlineTs,
@@ -1308,6 +1366,7 @@ wss.on("connection", (ws) => {
       if (!userKey) { send(ws, { type:"error", message:"Нет userKey" }); return; }
 
       const profile = sanitizeProfile(msg.profile);
+      if (ensureUserSingleRoom(ws, userKey)) return;
 
       // Быстрая игра: переводной + подкид ото всех (стандарт)
       const winMode = randomChoice(["classic", "draw"]);
@@ -1383,6 +1442,7 @@ wss.on("connection", (ws) => {
       if (!userKey) { send(ws, { type:"error", message:"Нет userKey" }); return; }
 
       const profile = sanitizeProfile(msg.profile);
+      if (ensureUserSingleRoom(ws, userKey)) return;
       const requestedPlayers = Number(msg.maxPlayers);
       if (!Number.isInteger(requestedPlayers) || requestedPlayers < 2 || requestedPlayers > 6) {
         send(ws, { type:"error", message:"Некорректное количество игроков" });
@@ -1405,6 +1465,7 @@ wss.on("connection", (ws) => {
       if (!userKey) { send(ws, { type:"error", message:"Нет userKey" }); return; }
 
       const profile = sanitizeProfile(msg.profile);
+      if (ensureUserSingleRoom(ws, userKey)) return;
       const roomId = safeStr(msg.roomId || "", 64);
       const password = safeStr(msg.password || "", 32);
 
